@@ -113,9 +113,21 @@ func (store *MessageStore) Close() error {
 }
 
 // Store a chat in the database
+//
+// History sync delivers older batches after newer messages, so the last message
+// time only ever moves forward. Stored times carry the local UTC offset of when
+// they were written, so they are compared with julianday() rather than as text.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = excluded.name,
+			last_message_time = CASE
+				WHEN julianday(chats.last_message_time) IS NULL
+					OR julianday(excluded.last_message_time) > julianday(chats.last_message_time)
+				THEN excluded.last_message_time
+				ELSE chats.last_message_time
+			END`,
 		jid, name, lastMessageTime,
 	)
 	return err

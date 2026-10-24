@@ -178,7 +178,7 @@ def get_message_changes(message_id: str, chat_jid: str) -> Tuple[bool, List[str]
             SELECT kind, content
             FROM message_changes
             WHERE message_id = ? AND chat_jid = ?
-            ORDER BY timestamp ASC
+            ORDER BY julianday(timestamp) ASC
         """, (message_id, chat_jid))
 
         deleted = False
@@ -468,7 +468,7 @@ def list_chats(
                 LEFT JOIN messages ON messages.rowid = (
                     SELECT rowid FROM messages
                     WHERE chat_jid = chats.jid
-                    ORDER BY timestamp DESC
+                    ORDER BY julianday(timestamp) DESC
                     LIMIT 1
                 )
             """)
@@ -483,8 +483,9 @@ def list_chats(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
-        # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "display_name(chats.jid, chats.name)"
+        # Add sorting. Stored times carry the UTC offset they were written with,
+        # so text order is not time order; julianday() compares the instants.
+        order_by = "julianday(chats.last_message_time) DESC" if sort_by == "last_active" else "display_name(chats.jid, chats.name)"
         query_parts.append(f"ORDER BY {order_by}")
         
         # Add pagination
@@ -583,7 +584,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
             WHERE m.sender = ? OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            ORDER BY julianday(c.last_message_time) DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
         
@@ -630,7 +631,7 @@ def get_last_interaction(jid: str) -> str:
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
-            ORDER BY m.timestamp DESC
+            ORDER BY julianday(m.timestamp) DESC
             LIMIT 1
         """, (jid, jid))
         
@@ -685,7 +686,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 LEFT JOIN messages m ON m.rowid = (
                     SELECT rowid FROM messages
                     WHERE chat_jid = c.jid
-                    ORDER BY timestamp DESC
+                    ORDER BY julianday(timestamp) DESC
                     LIMIT 1
                 )
             """
@@ -734,7 +735,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages
                 WHERE chat_jid = c.jid
-                ORDER BY timestamp DESC
+                ORDER BY julianday(timestamp) DESC
                 LIMIT 1
             )
             WHERE jid_matches(c.jid, ?) AND c.jid NOT LIKE '%@g.us'
