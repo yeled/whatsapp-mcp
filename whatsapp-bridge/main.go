@@ -84,6 +84,20 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Deletes and edits of earlier messages, kept apart so the original content survives
+		CREATE TABLE IF NOT EXISTS message_changes (
+			id TEXT,
+			chat_jid TEXT,
+			message_id TEXT,
+			kind TEXT,
+			sender TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (id, chat_jid)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_message_changes_message ON message_changes (message_id, chat_jid);
 	`)
 	if err != nil {
 		db.Close()
@@ -120,6 +134,17 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// Store a delete or edit of an earlier message
+func (store *MessageStore) StoreMessageChange(id, chatJID, messageID, kind, sender, content string, timestamp time.Time) error {
+	_, err := store.db.Exec(
+		`INSERT OR IGNORE INTO message_changes
+		(id, chat_jid, message_id, kind, sender, content, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, messageID, kind, sender, content, timestamp,
 	)
 	return err
 }
@@ -421,6 +446,30 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// Deletes and edits arrive as protocol messages that point at the original message
+	if protocolMsg := msg.Message.GetProtocolMessage(); protocolMsg != nil {
+		var kind, newContent string
+		switch protocolMsg.GetType() {
+		case waProto.ProtocolMessage_REVOKE:
+			kind = "deleted"
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			kind = "edited"
+			newContent = extractTextContent(protocolMsg.GetEditedMessage())
+		default:
+			return
+		}
+
+		originalID := protocolMsg.GetKey().GetID()
+		err = messageStore.StoreMessageChange(msg.Info.ID, chatJID, originalID, kind, sender, newContent, msg.Info.Timestamp)
+		if err != nil {
+			logger.Warnf("Failed to store message change: %v", err)
+		} else {
+			timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+			fmt.Printf("[%s] %s %s message %s %s\n", timestamp, sender, kind, originalID, newContent)
+		}
+		return
 	}
 
 	// Extract text content

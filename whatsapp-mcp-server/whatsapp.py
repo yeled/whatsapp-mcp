@@ -91,22 +91,59 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def get_message_changes(message_id: str, chat_jid: str) -> Tuple[bool, List[str]]:
+    """Return whether a message was deleted, and its edited versions oldest first."""
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT kind, content
+            FROM message_changes
+            WHERE message_id = ? AND chat_jid = ?
+            ORDER BY timestamp ASC
+        """, (message_id, chat_jid))
+
+        deleted = False
+        edits = []
+        for kind, content in cursor.fetchall():
+            if kind == "deleted":
+                deleted = True
+            elif kind == "edited":
+                edits.append(content)
+        return deleted, edits
+
+    except sqlite3.Error:
+        # Bridges older than the message_changes table don't record deletes or edits
+        return False, []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
+
     if show_chat_info and message.chat_name:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
+
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
+    content = message.content
+    deleted, edits = get_message_changes(message.id, message.chat_jid)
+    if edits:
+        times = "" if len(edits) == 1 else f" {len(edits)} times"
+        content = f"{edits[-1]} [edited{times}, originally: {message.content}]"
+    if deleted:
+        content_prefix = f"[deleted] {content_prefix}"
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        output += f"From: {sender_name}: {content_prefix}{content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
