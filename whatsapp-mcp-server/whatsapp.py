@@ -35,7 +35,7 @@ def _load_contacts():
         finally:
             conn.close()
     except sqlite3.Error as e:
-        print(f"Database error while loading contact names: {e}")
+        print(f"Database error while loading contact names: {e}", file=sys.stderr)
     return saved, fallback, lid_to_pn
 
 RESOLVER_TTL_SECONDS = 10
