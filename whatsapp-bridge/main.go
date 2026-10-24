@@ -24,11 +24,13 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -494,6 +496,53 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// messageChange reports whether msg deletes or edits an earlier message. ok with an empty kind
+// means it is a protocol message of some other type, which should not be stored.
+func messageChange(client *whatsmeow.Client, msg *events.Message, logger waLog.Logger) (kind, originalID, newContent string, ok bool) {
+	// Newer clients can send an edit encrypted with the original message's secret
+	if encMsg := msg.Message.GetSecretEncryptedMessage(); encMsg != nil {
+		if encMsg.GetSecretEncType() != waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+			return "", "", "", false
+		}
+		originalID = encMsg.GetTargetMessageKey().GetID()
+		decrypted, err := client.DecryptSecretEncryptedMessage(context.Background(), msg)
+		if err != nil {
+			logger.Warnf("Failed to decrypt edit of message %s: %v", originalID, err)
+			return "", "", "", false
+		}
+		newContent = extractTextContent(decrypted)
+		if edited := decrypted.GetProtocolMessage().GetEditedMessage(); edited != nil {
+			newContent = extractTextContent(edited)
+		}
+		return "edited", originalID, newContent, true
+	}
+
+	protocolMsg := msg.Message.GetProtocolMessage()
+	if protocolMsg == nil {
+		return "", "", "", false
+	}
+	switch protocolMsg.GetType() {
+	case waProto.ProtocolMessage_REVOKE:
+		kind = "deleted"
+	case waProto.ProtocolMessage_MESSAGE_EDIT:
+		kind = "edited"
+		newContent = extractTextContent(protocolMsg.GetEditedMessage())
+	default:
+		return "", "", "", true
+	}
+	return kind, protocolMsg.GetKey().GetID(), newContent, true
+}
+
+// messageFields lists the top-level fields set on a message, for logging ones we don't handle
+func messageFields(msg *waProto.Message) string {
+	var names []string
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+	return strings.Join(names, ", ")
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
@@ -509,20 +558,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
-	// Deletes and edits arrive as protocol messages that point at the original message
-	if protocolMsg := msg.Message.GetProtocolMessage(); protocolMsg != nil {
-		var kind, newContent string
-		switch protocolMsg.GetType() {
-		case waProto.ProtocolMessage_REVOKE:
-			kind = "deleted"
-		case waProto.ProtocolMessage_MESSAGE_EDIT:
-			kind = "edited"
-			newContent = extractTextContent(protocolMsg.GetEditedMessage())
-		default:
+	// Deletes and edits point at the original message instead of carrying a message of their own
+	if kind, originalID, newContent, ok := messageChange(client, msg, logger); ok {
+		if kind == "" {
 			return
 		}
-
-		originalID := protocolMsg.GetKey().GetID()
 		err = messageStore.StoreMessageChange(msg.Info.ID, chatJID, originalID, kind, sender, newContent, msg.Info.Timestamp)
 		if err != nil {
 			logger.Warnf("Failed to store message change: %v", err)
@@ -539,8 +579,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media, naming what it held so unhandled kinds show up in the log
 	if content == "" && mediaType == "" {
+		logger.Infof("Skipped message %s in %s with no text or media: %s", msg.Info.ID, chatJID, messageFields(msg.Message))
 		return
 	}
 
